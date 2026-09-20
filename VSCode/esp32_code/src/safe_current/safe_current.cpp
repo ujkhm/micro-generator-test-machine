@@ -62,7 +62,7 @@ static bool brush_jump_detected(uint32_t now_ms, bool loaded, uint32_t phase_ela
 
     if (loaded)
     {
-        // 帶載時電壓仍被 5Ω 壓在低位、只有電流掉光：那是 INA 分流雜訊，不是跳刷。
+        // 帶載時電壓仍被測試電阻壓在低位、只有電流掉光：那是 INA 分流雜訊，不是跳刷。
         const float voc = meas_get_safe_oc_voltage_V();
         if (voc > 1.0f && v_now < voc * (float)SAFE_I_OPEN_V_RATIO)
         {

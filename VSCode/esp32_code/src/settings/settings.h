@@ -53,7 +53,7 @@
 // 從馬達一啟動就開始計時、全程持續生效，不會有「還沒等到某個階段」或
 // 「已經動過一次就永久失效」之類的空窗——任何時刻卡死(卡死/斷軸/感測器
 // 故障/接線脫落等)都會在此時限內被抓到。
-// 5Ω 負載通斷是階躍擾動：轉速會瞬間掉/衝，光柵脈衝間隔會暫時拉長，
+// 測試負載通斷是階躍擾動：轉速會瞬間掉/衝，光柵脈衝間隔會暫時拉長，
 // 但不代表卡死。門檻需大於「負載階躍後 PID 把轉速拉回可讀區」的最長無脈衝空窗，
 // 又遠短於真的卡死。請依實測「按下 START 到第一次脈衝」與「接負載後最大脈衝間隔」
 // 抓安全餘量；數值愈小保護愈即時，但也愈容易在負載階躍時誤判。
@@ -104,7 +104,7 @@
 #define SPEED_FILTER_ALPHA 0.22f // 轉速量測的 EMA 濾波係數(愈小愈平滑、愈慢反應)
 #define PID_OUTPUT_SLEW_MAX 60  // 定速閉環每次控制週期(read_space)PWM 最大變化量(count，滿載為 1023)
 // 負載通斷 / 換轉速檔時的短暫增益排程(只在這兩類擾動期間生效，穩態維持調參值)：
-// 調參得到的 NoOvershoot_PI 偏保守，5Ω 階躍或 +300RPM 換檔時 PWM 被斜率限制慢慢爬。
+// 調參得到的 NoOvershoot_PI 偏保守，負載階躍或 +300RPM 換檔時 PWM 被斜率限制慢慢爬。
 // 暫態把 Kp/Ki 與斜率上限一起加大；連續貼近目標或逾時立刻退回原值。
 // 誤差輔助必須連續成立才進、連續貼近才退：單筆光柵離群／EMA 晃過門檻不得把增益×2、slew
 // 放到接近滿載，否則會抽搐（實測 PWM 單步 170～234、暫態 ON/OFF 每秒來回）。
@@ -156,7 +156,7 @@ enum speed_fault_code : uint8_t
 
 // ---- INA232 電壓/電流感測 ----
 // 原理圖 R8=0.1Ω(2512)；ADCRANGE=0(±81.92mV) → 理論最大約 0.819A，故 Imax 取 0.8A 留餘量
-// 晶片 AVG=16。帶載時 V 仍像被 5Ω 拉住而 I≈0：標 current_plausible=false，
+// 晶片 AVG=16。帶載時 V 仍像被測試電阻拉住而 I≈0：標 current_plausible=false，
 // 不把這筆寫進 EMA、也不准安全電流／內阻拿去算結果。不可用上一筆電流假裝還在測。
 #define INA232_I2C_ADDR 0x40     // INA232A + A0→GND；若 A0 接 VS/SDA/SCL 請改 0x41/0x42/0x43
 #define INA232_RSHUNT_OHM 0.1f   // 分流電阻(Ω)，對應原理圖 R8
@@ -487,7 +487,7 @@ struct ina232_sensor
     float shunt_mV = 0.0f;     // 分流電壓(mV)，除錯用
     bool online = false;       // 是否成功辨識到 INA232(Manufacturer ID)
     bool data_valid = false;       // 是否已有至少一筆成功讀值
-    bool current_plausible = true; // 帶載時 V/I 是否符合 5Ω；false 時 current_A 仍是原始讀值，禁止當測試數據
+    bool current_plausible = true; // 帶載時 V/I 是否符合 LOAD_TEST_RESISTOR_OHM；false 時 current_A 仍是原始讀值，禁止當測試數據
     uint32_t sample_count = 0;     // 累計成功讀取次數
 };
 extern volatile ina232_sensor ina_settings; // 實體在 ina232.cpp
@@ -554,7 +554,7 @@ SETTINGS_SCALAR_ACCESSOR(ui, ui_settings, g_ui_mux, oled_ok, bool)
 
 // ---- 負載開關：沿用 pins.h 既有的 SERVO_PIN(不改名)，高電位＝把測試負載接上發電機 ----
 #define LOAD_SWITCH_ACTIVE_HIGH 1    // 1=高電位接通負載；0=低電位接通
-#define LOAD_TEST_RESISTOR_OHM 5.0f // 測試負載標稱電阻(Ω)，對應安全電流／內阻兩模組共用的固定負載；須與實物一致
+#define LOAD_TEST_RESISTOR_OHM (10.0f / 3.0f) // 三顆 10Ω 並聯≈3.33Ω；須與實物一致，程式不會自測外接電阻
 #define LOAD_SWITCH_SETTLE_MS 60     // 切換負載後，繼電器/MOSFET 接點穩定的等待(ms)
 
 // ---- 發電機防反接串聯蕭特基二極體(SS54)電壓補償 ----
@@ -613,8 +613,8 @@ inline float ss54_compensate_voltage_V(float measured_bus_V, float current_A)
 #define SAFE_I_OPEN_V_RATIO 0.50f                       // V >= Voc*此比例才像真開路(帶載時端子會被拉低很多)
 #define SAFE_I_CONTACT_CONFIRM_MS 400                   // 開路特徵需連續成立才當夾子鬆脫；INA 單筆電流雜訊不算
 
-// 帶載且端子仍被 5Ω 拉在低電壓時，電流必須約等於 V/R。I≈0 而 V 仍是 1～2V：這一筆不是真實電流，
-// 禁止寫進 I_cont／熱下垂／內阻。電壓已高到不像 5Ω 帶載（真開路）則不算 mismatch。
+// 帶載且端子仍被測試電阻拉在低電壓時，電流必須約等於 V/R。I≈0 而 V 仍是 1～2V：這一筆不是真實電流，
+// 禁止寫進 I_cont／熱下垂／內阻。電壓已高到不像帶載（真開路）則不算 mismatch。
 inline bool ina_loaded_vi_mismatch(float bus_V, float current_A)
 {
     const float i_from_v = bus_V / (float)LOAD_TEST_RESISTOR_OHM;

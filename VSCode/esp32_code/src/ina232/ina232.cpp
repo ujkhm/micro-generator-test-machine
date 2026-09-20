@@ -132,7 +132,7 @@ static bool ina_sample_once()
         }
     }
 
-    // 負載接通且端子已被 5Ω 拉低時，I 必須約等於 V/R。對不上就標不可信、發布原始 0A（讓你看得見），
+    // 負載接通且端子已被測試電阻拉低時，I 必須約等於 V/R。對不上就標不可信、發布原始 0A（讓你看得見），
     // 但不把 0 寫進 EMA，也不准量測模組拿去當 I_cont。不可用上一筆電流假裝還在測。
     const bool mismatch = ema_inited && meas_get_load_connected() &&
                           ina_loaded_vi_mismatch(bus_V, current_A);

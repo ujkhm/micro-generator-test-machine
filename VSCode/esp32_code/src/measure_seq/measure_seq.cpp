@@ -71,7 +71,7 @@ static bool check_generator_link(uint32_t now_ms)
     const bool ina_ok = ina_get_online() && ina_get_data_valid();
     const float v = ina_ok ? ina_get_bus_V() : 0.0f;
     const float i = ina_ok ? fabsf(ina_get_current_A()) : 0.0f;
-    // 帶載時端子會被 5Ω 拉到很低，不能單看 V<0.15 就當發電機沒輸出。
+    // 帶載時端子會被測試電阻拉到很低，不能單看 V<0.15 就當發電機沒輸出。
     // 真的沒輸出：電壓接近 0 且電流也接近 0（或 INA 離線）。V=1.6 I=0 走 INA mismatch，不走這裡。
     const bool no_output = (!ina_ok) ||
                            ((v < (float)GEN_LINK_LOST_V_MAX) && (i < (float)SAFE_I_MIN_VALID_A));
