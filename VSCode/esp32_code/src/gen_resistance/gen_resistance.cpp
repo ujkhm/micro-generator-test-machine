@@ -1,9 +1,12 @@
 #include "gen_resistance.h"
 #include "measure_seq/measure_seq.h"
+#include "motor_PID/motor_PID.h"
 #include "pins/pins.h"
 #include "debug_tee/debug_tee.h"
 
 static float res_oc_rpm = 0.0f; // 開路取樣當下的轉速，帶載時用來把 Voc 對到同一轉速
+static float res_load_rpm = 0.0f; // 帶載取樣當下的轉速，斷開後不再用可能已經變掉的即時值
+static bool res_await_unload = false;
 
 // 高/中/低三個轉速點：低＝安全電流階梯實際的起始轉速(自動調參後系統自然停下來的那個
 // 轉速，不是任何寫死的常數)；高＝安全電流實際通過的最高檔(I_cont 對應的轉速)；
@@ -35,6 +38,8 @@ static void goto_phase(uint8_t ph)
 void gen_resistance_reset()
 {
     res_oc_rpm = 0.0f;
+    res_load_rpm = 0.0f;
+    res_await_unload = false;
     load_switch_set(false);
     SettingsLockGuard lock(g_meas_mux);
     meas_settings.res_phase = RES_PH_PREP;
@@ -59,6 +64,8 @@ void gen_resistance_reset()
 void gen_resistance_rewind_current_point()
 {
     res_oc_rpm = 0.0f;
+    res_load_rpm = 0.0f;
+    res_await_unload = false;
     load_switch_set(false);
     goto_phase(RES_PH_PREP);
     Serial.printf("[RES] rewind current point PREP idx=%u valid_points=%u\n",
@@ -69,10 +76,12 @@ void gen_resistance_rewind_current_point()
 // 整機安全鎖定：比照安全電流模組的 fail_hard()，效果等同 ESTOP，需重開機
 static void fail_hard(const char *reason)
 {
+    meas_set_pause_request(true);
+    speed_set_ol_pwm_cmd(0);
+    ledcWrite(MOTOR_PWM_PIN, 0);
     load_switch_set(false);
     Serial.printf("[RES] HARD FAIL: %s\n", reason);
     speed_trigger_fault(FAULT_MEASURE_SAFETY);
-    ledcWrite(MOTOR_PWM_PIN, 0);
 }
 
 static bool fail_contact(const char *reason)
@@ -235,6 +244,17 @@ bool gen_resistance_step(uint32_t now_ms)
         return false;
 
     case RES_PH_LOAD_SAMPLE:
+        if (res_await_unload)
+        {
+            if (load_switch_is_connected())
+            {
+                pid_request_unload();
+                return false;
+            }
+            res_await_unload = false;
+            goto_phase(RES_PH_COMPUTE);
+            return false;
+        }
         if (elapsed < (uint32_t)RES_LOAD_SAMPLE_MS)
         {
             if (ina_get_online() && ina_get_data_valid())
@@ -280,11 +300,13 @@ bool gen_resistance_step(uint32_t now_ms)
                               (double)i, (double)v, (double)voc);
                 return false;
             }
-            load_switch_set(false); // 取完立刻斷開，不做熱浸泡(內阻要快，避免量到熱態)
+            // 先記住帶載轉速，再請 PID 拉回空載 PWM 後才斷開。直接斷開時高轉會爆衝。
+            res_load_rpm = speed_get_now_speed();
             meas_set_res_load_V(v);
             meas_set_res_load_A(i);
+            pid_request_unload();
+            res_await_unload = true;
         }
-        goto_phase(RES_PH_COMPUTE);
         return false;
 
     case RES_PH_COMPUTE:
@@ -292,7 +314,8 @@ bool gen_resistance_step(uint32_t now_ms)
         const float voc = meas_get_res_oc_voltage_V();
         const float v = meas_get_res_load_V();
         const float i = meas_get_res_load_A();
-        const float n_load = speed_get_now_speed();
+        const float n_live = speed_get_now_speed();
+        const float n_load = (res_load_rpm > 1.0f) ? res_load_rpm : n_live;
         const float n_oc = res_oc_rpm;
         // 開路與帶載的轉速若還有一點差，把 Voc 乘上 n_load/n_oc，避免轉速沒完全拉回就把差算進 R_th。
         const float voc_at_load = (n_oc > 1.0f && n_load > 1.0f) ? (voc * (n_load / n_oc)) : voc;

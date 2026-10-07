@@ -9,7 +9,8 @@
 // 每檔用當下轉速、電壓、電流換算 R_th，對冷態基準看銅溫升，找出可長期使用的安全電流 I_cont。
 // 呼叫端(measure_seq)須確保呼叫本函式時已經在 MEAS_SAFE_CURRENT 階段；
 // 本模組自己的第一步就是設定目標轉速並等待 speed_stable，不要求呼叫當下就穩調。
-// 識別成功結束前會先 PWM=0 滑行、再拉回上一通過檔，避免滿 PWM 開路飛車後才進內阻。
+// 識別成功結束前會先把 PWM 拉回空載值再斷開負載。有記住空載 PWM 時不再先滑行到 0
+// (那會先爆衝再被砍速)；沒有空載 PWM 時仍 PWM=0 滑行，避免滿 duty 開路飛車後才進內阻。
 void safe_current_reset();               // 重置回本模組最初狀態(全新開始)
 void safe_current_rewind_current_rung(); // 夾子鬆脫續測：回到本檔 PREP，保留已通過檔
 bool safe_current_step(uint32_t now_ms); // 執行一次狀態機步進；回傳 true=識別已結束(成功或硬故障)

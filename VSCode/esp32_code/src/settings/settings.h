@@ -116,6 +116,10 @@
 #define PID_ASSIST_ERR_RPM 90.0f         // 誤差再大過此值才開始計「誤差輔助」(帶載後半段爬升過慢)
 #define PID_ASSIST_NEED_HITS 10          // 連續超差幾次才進暫態：單筆離群／EMA 抖動不觸發
 #define PID_LOAD_ON_PWM_BUMP 90          // 負載接通當下先加的 PWM count，抵消發電機扭矩階躍
+// 斷開時不能只減掉上面這個固定值：發電機扭矩隨轉速上升，高轉(約 3500RPM 以上)
+// 帶載 PWM 比空載高一截，固定減 90 仍會開路爆衝。斷開當下改拉回「接通前」的空載 PWM，
+// 並在重新穩調前把輸出上限夾在該值加上這個餘量。
+#define PID_UNLOAD_HOLD_SLACK 40
 
 // 轉速穩調旗標(speed_stable)判定：僅在整機正常閉環且貼近目標時才可能為 true
 #define SPEED_STABLE_ABS_EPS 40.0f             // |實際轉速-目標| 低於此值的基底(RPM)

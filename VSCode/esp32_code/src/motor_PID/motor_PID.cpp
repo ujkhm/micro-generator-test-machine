@@ -1,4 +1,5 @@
 #include "motor_PID.h"
+#include "measure_seq/measure_seq.h"
 #include <sTune.h>
 #include "debug_tee/debug_tee.h"
 
@@ -52,6 +53,10 @@ static bool pid_last_load_connected = false;
 static float last_keep_for_gain = -1.0f;
 static uint8_t pid_assist_hits = 0;
 static uint8_t pid_transient_exit_hits = 0;
+// 接通負載前的空載 PWM。斷開時拉回這個值：高轉帶載 duty 遠高於空載，固定減 90 擋不住爆衝。
+static float pid_unloaded_pwm = -1.0f;
+static volatile bool pid_unload_req = false;
+static volatile bool pid_unload_hold = false;
 
 // ★記憶體保護★：本檔案對 settings/PID_settings 的存取一律透過 settings.h 提供的
 // 介面——單一欄位讀寫用 speed_get_x()/set_x()、pid_get_x()/set_x()；需要「一次原子
@@ -204,6 +209,35 @@ static void pid_reset_transient_state(QuickPID *myPID)
     last_keep_for_gain = -1.0f;
     pid_assist_hits = 0;
     pid_transient_exit_hits = 0;
+    pid_unload_hold = false;
+}
+
+void pid_request_unload()
+{
+    pid_unload_req = true;
+}
+
+bool pid_unload_holding()
+{
+    return pid_unload_hold;
+}
+
+// 把輸出與積分拉回接通前的空載 PWM。必須在 PID 任務裡呼叫(QuickPID 狀態不能跨任務寫)。
+static void pid_snap_to_unloaded(QuickPID &myPID)
+{
+    if (pid_unloaded_pwm < 0.0f)
+    {
+        pid_unload_hold = false;
+        return;
+    }
+    const float restored = fminf(fmaxf(pid_unloaded_pwm, 0.0f), max_pwm_value);
+    pid_output = restored;
+    last_final_pwm = (uint16_t)restored;
+    myPID.SetOutputSum(restored - myPID.GetPterm());
+    pid_unload_hold = true;
+    clear_speed_stable();
+    Serial.printf("[PID] unload snap to no-load pwm %.0f (cap +%u until stable)\n",
+                  (double)restored, (unsigned)PID_UNLOAD_HOLD_SLACK);
 }
 
 static void pid_update_transient_enter(QuickPID &myPID, uint32_t now_ms)
@@ -218,8 +252,18 @@ static void pid_update_transient_enter(QuickPID &myPID, uint32_t now_ms)
     }
     else if (load_now != pid_last_load_connected)
     {
+        if (load_now)
+        {
+            // 接通前的 duty 就是這一轉速的空載 PWM，斷開時要拉回來。
+            pid_unloaded_pwm = fminf(fmaxf(pid_output, 0.0f), max_pwm_value);
+        }
         pid_last_load_connected = load_now;
         pid_enter_transient(myPID, now_ms, load_now ? "load ON" : "load OFF", load_now, true);
+        if (!load_now)
+        {
+            // 別的模組已經先斷開：同一個週期內把積分拉回，不要再送出帶載 duty。
+            pid_snap_to_unloaded(myPID);
+        }
     }
 
     if (last_keep_for_gain < 0.0f)
@@ -228,6 +272,11 @@ static void pid_update_transient_enter(QuickPID &myPID, uint32_t now_ms)
     }
     else if (fabsf(keep_now - last_keep_for_gain) > 0.5f)
     {
+        // 目標明顯提高(下一檔)才放開上限；往下調不必放開，上限本來就不擋降 PWM。
+        if (pid_unload_hold && keep_now > last_keep_for_gain + 80.0f)
+        {
+            pid_unload_hold = false;
+        }
         last_keep_for_gain = keep_now;
         pid_enter_transient(myPID, now_ms, "rpm step", false, true);
     }
@@ -851,6 +900,12 @@ void motor_PID_init(void *pvParameters)
             speed_set_ol_pwm_cmd(0);
             speed_set_init_phase(SPEED_PHASE_PID_PAUSED);
             ledcWrite(MOTOR_PWM_PIN, 0);
+            if (pid_unload_req && meas_get_load_connected())
+            {
+                load_switch_set(false);
+                pid_last_load_connected = false;
+                pid_unload_req = false;
+            }
             continue;
         }
         // 暫停已放行：必須立刻離開 PID_PAUSED。否則 speed_sensor 為了避免暫停中
@@ -929,6 +984,34 @@ void motor_PID_init(void *pvParameters)
         }
 
         const uint32_t now_ms = millis();
+
+        // 先改 PWM、再斷負載，而且兩件事都在這個任務裡做完。
+        // 若等量測任務先斷開，下一個週期才把 duty 降下來，高轉帶載 PWM 會讓馬達先爆衝。
+        if (pid_unload_req)
+        {
+            if (meas_get_load_connected())
+            {
+                pid_snap_to_unloaded(myPID);
+                if (!pid_unload_hold)
+                {
+                    // 沒有接通前的空載 PWM 可拉回：先歸零再斷開，積分從 0 爬，不要留著帶載 duty。
+                    pid_output = 0.0f;
+                    last_final_pwm = 0;
+                    myPID.SetOutputSum(0.0f - myPID.GetPterm());
+                }
+                ledcWrite(MOTOR_PWM_PIN, (uint32_t)last_final_pwm);
+                speed_set_ol_pwm_cmd(last_final_pwm);
+                load_switch_set(false);
+                pid_last_load_connected = false;
+            }
+            pid_unload_req = false;
+        }
+
+        if (pid_unload_hold && speed_get_speed_stable())
+        {
+            pid_unload_hold = false;
+        }
+
         pid_update_transient_enter(myPID, now_ms);
 
         // 先做快照(要在 SetMode 之前，QuickPID 切自動時會用當下的輸入/輸出做無擾接棒)
@@ -973,6 +1056,24 @@ void motor_PID_init(void *pvParameters)
             slew_clamped = true;
         }
         final_pwm_f = constrain(final_pwm_f, 0.0f, max_pwm_value);
+        if (pid_unload_hold && pid_unloaded_pwm >= 0.0f)
+        {
+            const float cap = fminf(pid_unloaded_pwm + (float)PID_UNLOAD_HOLD_SLACK, max_pwm_value);
+            if (final_pwm_f > cap)
+            {
+                final_pwm_f = cap;
+                slew_clamped = true;
+            }
+        }
+        // 量測任務若已要求暫停，這輪結尾不得再把帶載 duty 寫回去蓋過 ledcWrite(0)。
+        if (meas_get_pause_request())
+        {
+            pid_output = 0.0f;
+            last_final_pwm = 0;
+            speed_set_ol_pwm_cmd(0);
+            ledcWrite(MOTOR_PWM_PIN, 0);
+            continue;
+        }
         const uint32_t final_pwm = (uint32_t)final_pwm_f; // 僅供寫硬體/事件旗標，不回頭污染 PID 狀態
         last_final_pwm = (uint16_t)final_pwm_f;
 

@@ -1,5 +1,6 @@
 #include "safe_current.h"
 #include "measure_seq/measure_seq.h"
+#include "motor_PID/motor_PID.h"
 #include "pins/pins.h"
 #include "debug_tee/debug_tee.h"
 
@@ -391,24 +392,38 @@ static void finish_with_result(float i_cont_A, float i_cont_rpm)
 // ★呼叫 speed_trigger_fault() 後立即自行 ledcWrite(0)：不等 motor_PID 任務下一輪才反應。
 static void fail_hard(const char *reason)
 {
+    meas_set_pause_request(true);
+    speed_set_ol_pwm_cmd(0);
+    ledcWrite(MOTOR_PWM_PIN, 0);
     load_switch_set(false);
     Serial.printf("[SAFE_I] HARD FAIL: %s\n", reason);
     speed_trigger_fault(FAULT_MEASURE_SAFETY);
-    ledcWrite(MOTOR_PWM_PIN, 0);
 }
 
-// 進內阻前必須先切斷 PWM、倒掉積分：光柵可能讀偏低，只改 keep 仍會頂滿開路飛車。
-// Voc 才是真實轉速。滑行到上一檔 Voc 後放行 PID，等 recapture 穩調才回傳 true。
+// 進內阻前負載必須先在空載 PWM 下斷開。有記住接通前的 duty 時直接停在上一通過檔；
+// 沒有時才 PWM=0 滑行到 Voc 回落，避免光柵讀偏低、積分還是帶載值，一放行就開路飛車。
 static void begin_handoff_to_resistance(float i_cont_A, float last_pass_rpm, const char *why)
 {
-    load_switch_set(false);
+    // 先讀旗標再改 keep：改目標可能讓 PID 放開空載上限，但只要斷開當下已經拉回空載 PWM，
+    // 就不要再砍成 0，否則高轉會先爆衝(舊路徑)或先被滑行拖慢再拉回。
+    const bool held = pid_unload_holding();
     finish_with_result(i_cont_A, last_pass_rpm);
     meas_set_safe_target_rpm(last_pass_rpm);
     pid_set_keep_rpm(last_pass_rpm);
-    handoff_released = false;
+    if (held)
+    {
+        load_switch_set(false);
+        handoff_released = true;
+        goto_phase(SAFE_PH_HANDOFF);
+        Serial.printf("[SAFE_I] handoff: no-load pwm hold, recapture %.0fRPM (%s) I_cont=%.3fA\n",
+                      (double)last_pass_rpm, why, (double)i_cont_A);
+        return;
+    }
     meas_set_pause_request(true);
     speed_set_ol_pwm_cmd(0); // 看門狗看的是 ol_pwm_cmd，不能只寫 LEDC
     ledcWrite(MOTOR_PWM_PIN, 0);
+    load_switch_set(false);
+    handoff_released = false;
     goto_phase(SAFE_PH_HANDOFF);
     Serial.printf("[SAFE_I] handoff: PWM cut, coast then recapture %.0fRPM (%s) I_cont=%.3fA\n",
                   (double)last_pass_rpm, why, (double)i_cont_A);
@@ -829,7 +844,13 @@ bool safe_current_step(uint32_t now_ms)
 
     case SAFE_PH_JUDGE:
     {
-        load_switch_set(false); // 判定前先斷開，不再繼續加熱
+        // 先等 PID 把 duty 拉回空載值再斷開。直接斷開會讓高轉(約 3500RPM 以上)帶載 PWM
+        // 在開路下先爆衝，接著交接滑行或回控才降下來。
+        if (load_switch_is_connected())
+        {
+            pid_request_unload();
+            return false;
+        }
         const float rpm_cmd = meas_get_safe_target_rpm();
         const float rpm_pass = (rung_result_rpm > 1.0f) ? rung_result_rpm : rpm_cmd;
         const float hot_a = meas_get_safe_hot_A();
