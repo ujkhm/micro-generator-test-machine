@@ -1,6 +1,7 @@
 #include "board_ui.h"
 #include "soft_i2c/soft_i2c.h"
 #include <U8g2lib.h>
+#include "debug_tee/debug_tee.h"
 
 volatile board_ui ui_settings{};
 

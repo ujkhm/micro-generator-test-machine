@@ -1,5 +1,6 @@
 #include "ina232.h"
 #include "soft_i2c/soft_i2c.h"
+#include "debug_tee/debug_tee.h"
 
 // 共享感測結果(其他模組只讀)
 volatile ina232_sensor ina_settings{};

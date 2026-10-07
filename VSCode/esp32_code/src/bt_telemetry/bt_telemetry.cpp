@@ -1,6 +1,8 @@
 #include "bt_telemetry.h"
 #include "BluetoothSerial.h"
+#include "debug_tee/debug_tee.h"
 #include <cstdarg>
+#include <cstdio>
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled on this build (BluetoothSerial requires Bluedroid classic BT).
@@ -19,7 +21,7 @@ static constexpr uint32_t CURVE_PERIOD_MS = 3000; // 曲線表重送週期(靜�
 // 避免在 FreeRTOS 任務堆疊上放大陣列(有溢出風險)，也避免 String/malloc 造成的
 // heap 碎片化與配置失敗風險——整個量測序列在跑的過程中，這兩塊緩衝區大小固定、
 // 生命週期等於整個程式執行期，記憶體占用可以在編譯期就精確算出來。
-static char live_buf[2048];
+static char live_buf[2560];
 static char curve_buf[6144];
 
 // 邊界安全的字串附加：用剩餘容量夾住 snprintf，任何情況都不會寫出 buf 範圍，
@@ -167,11 +169,14 @@ static void build_live_message()
     append(live_buf, sizeof(live_buf), len,
            "\"safe_phase\":%u,\"safe_target_rpm\":%.0f,\"safe_oc_V\":%.3f,"
            "\"safe_electrical_A\":%.4f,\"safe_hot_A\":%.4f,\"safe_droop_ratio\":%.4f,"
+           "\"safe_rth_ohm\":%.3f,\"safe_winding_rise_C\":%.1f,\"safe_winding_rise_limit_C\":%.1f,"
            "\"safe_phase_elapsed_ms\":%lu,\"safe_done\":%d,\"safe_pass_any\":%d,"
            "\"safe_i_cont_A\":%.4f,\"safe_i_cont_rpm\":%.0f,",
            (unsigned)meas_get_safe_phase(), (double)meas_get_safe_target_rpm(),
            (double)meas_get_safe_oc_voltage_V(), (double)meas_get_safe_electrical_A(),
            (double)meas_get_safe_hot_A(), (double)meas_get_safe_droop_ratio(),
+           (double)meas_get_safe_rth_ohm(), (double)meas_get_safe_winding_rise_C(),
+           (double)meas_get_safe_winding_rise_limit_C(),
            (unsigned long)(millis() - meas_get_safe_phase_start_ms()),
            (int)meas_get_safe_done(), (int)meas_get_safe_pass_any(),
            (double)meas_get_safe_i_cont_A(), (double)meas_get_safe_i_cont_rpm());
@@ -225,6 +230,63 @@ static inline void bt_increment_publish_count_wrapper()
     bt_settings.publish_count = bt_settings.publish_count + 1;
 }
 
+static char cmd_buf[48];
+static size_t cmd_len = 0;
+
+// 上位機一行：RISE <溫升°C>。只接受 10～200，避免空字串或亂碼把上限清掉。
+static void bt_handle_command(const char *line)
+{
+    float rise = 0.0f;
+    if (sscanf(line, "RISE %f", &rise) != 1)
+    {
+        return;
+    }
+    if (rise < 10.0f)
+    {
+        rise = 10.0f;
+    }
+    else if (rise > 200.0f)
+    {
+        rise = 200.0f;
+    }
+    meas_set_safe_winding_rise_limit_C(rise);
+    Serial.printf("[BT] winding rise limit %.1f C\n", (double)rise);
+}
+
+static void bt_poll_commands()
+{
+    while (SerialBT.available() > 0)
+    {
+        const int c = SerialBT.read();
+        if (c < 0)
+        {
+            break;
+        }
+        if (c == '\r')
+        {
+            continue;
+        }
+        if (c == '\n')
+        {
+            cmd_buf[cmd_len] = '\0';
+            if (cmd_len > 0)
+            {
+                bt_handle_command(cmd_buf);
+            }
+            cmd_len = 0;
+            continue;
+        }
+        if (cmd_len + 1 < sizeof(cmd_buf))
+        {
+            cmd_buf[cmd_len++] = (char)c;
+        }
+        else
+        {
+            cmd_len = 0;
+        }
+    }
+}
+
 static void bt_telemetry_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -244,8 +306,11 @@ static void bt_telemetry_task(void *pvParameters)
         bt_set_client_connected(has_client);
         if (!has_client)
         {
-            continue; // 沒人連線就不必組字串、不必寫序列埠，省 CPU
+            continue; // 沒人連線就留在佇列裡；連上後再把最近的除錯行送出
         }
+
+        bt_poll_commands();
+        debug_log_drain(SerialBT, 6);
 
         if ((now - last_live_ms) >= LIVE_PERIOD_MS)
         {

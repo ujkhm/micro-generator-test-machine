@@ -1,4 +1,5 @@
 #include "curve_calc.h"
+#include "debug_tee/debug_tee.h"
 
 static float round_up_to_step(float v, float step)
 {
@@ -36,6 +37,7 @@ void curve_calc_run()
     float n_lim = fminf(fminf(n_knee, n_voc), (float)SAFE_RPM_MAX_CEILING);
     const float brush_cap = meas_get_brush_jump_rpm();
     const float drive_cap = meas_get_drive_limit_rpm();
+    const float thermal_cap = meas_get_thermal_limit_rpm();
     if (brush_cap > 1.0f)
     {
         n_lim = fminf(n_lim, brush_cap);
@@ -44,8 +46,16 @@ void curve_calc_run()
     {
         n_lim = fminf(n_lim, drive_cap);
     }
+    if (thermal_cap > 1.0f)
+    {
+        n_lim = fminf(n_lim, thermal_cap);
+    }
     uint8_t reason;
-    if (drive_cap > 1.0f && n_lim >= drive_cap - 1e-3f)
+    if (thermal_cap > 1.0f && n_lim >= thermal_cap - 1e-3f)
+    {
+        reason = LIMIT_REASON_WINDING_TEMP;
+    }
+    else if (drive_cap > 1.0f && n_lim >= drive_cap - 1e-3f)
     {
         reason = LIMIT_REASON_DRIVE_LIMIT;
     }

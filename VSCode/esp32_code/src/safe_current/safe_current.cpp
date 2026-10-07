@@ -1,12 +1,24 @@
 #include "safe_current.h"
 #include "measure_seq/measure_seq.h"
 #include "pins/pins.h"
+#include "debug_tee/debug_tee.h"
+
+#include <cmath>
 
 // 本檔案只在自己的任務(measure_seq 建立)裡被呼叫，不會被其他任務並行呼叫，
 // 因此這幾個「本檔案內部才需要知道」的觀察窗變數用純 static 區域變數即可，
 // 不必放進共享結構(meas_settings 已經有 safe_droop_ratio 這個「結果」可供對外顯示)。
 static uint32_t judge_window_start_ms = 0;
-static float judge_window_start_A = 0.0f;
+static float judge_window_start_rth = 0.0f;
+static float rung_ke = 0.0f;          // 本檔開路 Voc / 開路轉速
+static float rung_oc_rpm = 0.0f;
+static float rth_cold_ohm = 0.0f;     // 第一檔轉速拉回後的冷態 R_th，整輪不重設
+static float rth_cold_acc = 0.0f;
+static uint8_t rth_cold_n = 0;
+static bool soak_rth_settled = false;
+static float rung_result_rpm = 0.0f;  // 判定當下的實際轉速(先快照，再斷負載)
+static float stall_ref_rpm = -1.0f;
+static uint32_t stall_ref_ms = 0;
 static uint32_t contact_open_since_ms = 0;
 static uint32_t contact_offline_since_ms = 0;
 static bool contact_glitch_logged = false;
@@ -153,26 +165,123 @@ static uint16_t motor_pwm_full_scale()
     return (uint16_t)((1u << res) - 1u);
 }
 
-// PWM 已頂滿、實際轉速仍明顯低於目標：主動力帶不動這一檔（不是夾子、也不是 INA）。
+// 帶載後轉速要回到目標附近才採熱穩。容許帶比 speed_stable 更緊，
+// 不能寬到把「卡在上一檔」也算成這一檔已經到了。
+static bool speed_within_target(float target_rpm, float rpm)
+{
+    const float err = fabsf(target_rpm - rpm);
+    const float abs_eps = (float)SPEED_STABLE_ABS_EPS +
+                          target_rpm * ((float)SPEED_STABLE_ABS_EPS_PER_1000RPM / 1000.0f);
+    const float rel_eps = (target_rpm > 1.0f) ? (target_rpm * (float)SPEED_STABLE_REL_EPS) : abs_eps;
+    float band = fmaxf(abs_eps, rel_eps);
+    const float step_cap = (float)SAFE_RPM_STEP * (float)SAFE_SPEED_RECOVER_STEP_FRAC;
+    if (band > step_cap)
+    {
+        band = step_cap;
+    }
+    return err <= band;
+}
+
+// 轉不到目標：PWM 頂滿，或轉速已經不再往上爬。後者不必再空等整段逾時。
 static bool drive_cannot_reach_target(uint32_t elapsed_ms, float target_rpm)
 {
     if (elapsed_ms < (uint32_t)SAFE_DRIVE_STALL_HOLD_MS)
     {
+        stall_ref_rpm = -1.0f;
+        return false;
+    }
+    const float rpm = speed_get_now_speed();
+    if (speed_within_target(target_rpm, rpm))
+    {
+        stall_ref_rpm = -1.0f;
         return false;
     }
     const uint16_t pwm = speed_get_ol_pwm_cmd();
     const uint16_t full = motor_pwm_full_scale();
-    if (pwm + (uint16_t)SAFE_DRIVE_STALL_PWM_SLACK < full)
+    if (pwm + (uint16_t)SAFE_DRIVE_STALL_PWM_SLACK >= full)
+    {
+        return true;
+    }
+    const uint32_t now = millis();
+    if (stall_ref_rpm < 0.0f)
+    {
+        stall_ref_rpm = rpm;
+        stall_ref_ms = now;
+        return false;
+    }
+    if ((now - stall_ref_ms) < (uint32_t)SAFE_DRIVE_STALL_HOLD_MS)
     {
         return false;
     }
-    const float rpm = speed_get_now_speed();
-    const float err = fabsf(target_rpm - rpm);
-    const float abs_eps = (float)SPEED_STABLE_ABS_EPS +
-                          target_rpm * ((float)SPEED_STABLE_ABS_EPS_PER_1000RPM / 1000.0f);
-    const bool near = (err <= abs_eps) ||
-                      ((target_rpm > 1.0f) && ((err / target_rpm) <= (float)SPEED_STABLE_REL_EPS));
-    return !near;
+    const bool flat = (rpm - stall_ref_rpm) < (float)SAFE_DRIVE_STALL_MIN_GAIN_RPM;
+    stall_ref_rpm = rpm;
+    stall_ref_ms = now;
+    return flat;
+}
+
+// R_th = (k_e·n − V) / I。k_e 用本檔開路，n、V、I 用同一筆，轉速被拉低再爬回來不會被看成電流下垂。
+static bool loaded_winding_rth(float *rth_out, float *i_out)
+{
+    if (!(rung_ke > 0.0f) || !(ina_get_online() && ina_get_data_valid() && ina_get_current_plausible()))
+    {
+        return false;
+    }
+    const float n = speed_get_now_speed();
+    const float i = fabsf(ina_get_current_A());
+    if (n < 1.0f || i < (float)SAFE_I_MIN_VALID_A)
+    {
+        return false;
+    }
+    const float v = ss54_compensate_voltage_V(ina_get_bus_V(), i);
+    const float emf = rung_ke * n;
+    if (!(emf > v + 0.02f))
+    {
+        return false;
+    }
+    const float rth = (emf - v) / i;
+    if (!isfinite(rth) || rth < (float)RES_MIN_OHM || rth > (float)RES_MAX_OHM)
+    {
+        return false;
+    }
+    *rth_out = rth;
+    if (i_out != nullptr)
+    {
+        *i_out = i;
+    }
+    return true;
+}
+
+static float winding_rise_limit_c()
+{
+    const float lim = meas_get_safe_winding_rise_limit_C();
+    if (lim >= 10.0f)
+    {
+        return lim;
+    }
+    return (float)SAFE_WINDING_RISE_MAX_C;
+}
+
+static void publish_winding(float rth)
+{
+    meas_set_safe_rth_ohm(rth);
+    if (rth_cold_ohm > 0.05f)
+    {
+        const float ratio = (rth / rth_cold_ohm) - 1.0f;
+        meas_set_safe_droop_ratio(ratio);
+        meas_set_safe_winding_rise_C(ratio / (float)COPPER_TEMPCO_PER_C);
+    }
+}
+
+static void clear_rung_sample()
+{
+    rung_ke = 0.0f;
+    rung_oc_rpm = 0.0f;
+    judge_window_start_ms = 0;
+    judge_window_start_rth = 0.0f;
+    soak_rth_settled = false;
+    rung_result_rpm = 0.0f;
+    stall_ref_rpm = -1.0f;
+    stall_ref_ms = 0;
 }
 
 // PWM 頂滿仍轉不到：不可帶著飽和積分／滿 PWM 直接進內阻(開路會飛車、光柵掉脈衝)。
@@ -224,9 +333,14 @@ void safe_current_reset()
         meas_settings.safe_last_pass_oc_V = 0.0f;
         meas_settings.brush_jump_rpm = 0.0f;
         meas_settings.drive_limit_rpm = 0.0f;
+        meas_settings.thermal_limit_rpm = 0.0f;
+        meas_settings.safe_rth_ohm = 0.0f;
+        meas_settings.safe_winding_rise_C = 0.0f;
     }
-    judge_window_start_ms = 0;
-    judge_window_start_A = 0.0f;
+    rth_cold_ohm = 0.0f;
+    rth_cold_acc = 0.0f;
+    rth_cold_n = 0;
+    clear_rung_sample();
     contact_open_since_ms = 0;
     contact_offline_since_ms = 0;
     contact_glitch_logged = false;
@@ -239,8 +353,12 @@ void safe_current_reset()
 void safe_current_rewind_current_rung()
 {
     load_switch_set(false);
-    judge_window_start_ms = 0;
-    judge_window_start_A = 0.0f;
+    if (rth_cold_ohm <= 0.0f)
+    {
+        rth_cold_acc = 0.0f;
+        rth_cold_n = 0;
+    }
+    clear_rung_sample();
     contact_open_since_ms = 0;
     contact_offline_since_ms = 0;
     contact_glitch_logged = false;
@@ -294,6 +412,39 @@ static void begin_handoff_to_resistance(float i_cont_A, float last_pass_rpm, con
     goto_phase(SAFE_PH_HANDOFF);
     Serial.printf("[SAFE_I] handoff: PWM cut, coast then recapture %.0fRPM (%s) I_cont=%.3fA\n",
                   (double)last_pass_rpm, why, (double)i_cont_A);
+}
+
+// 電流碰到硬上限：已有通過檔 → 斷負載，用上一通過檔進內阻(這就是這台機能測到的上限，不是故障)；
+// 第一檔就超過才鎖定。回傳值沿用步進函式慣例：true=已鎖定整機，false=已改走交接流程。
+static bool stop_at_current_ceiling(const char *reason)
+{
+    if (meas_get_safe_pass_any())
+    {
+        begin_handoff_to_resistance(meas_get_safe_last_pass_A(),
+                                    meas_get_safe_last_pass_rpm(), reason);
+        return false;
+    }
+    fail_hard(reason);
+    return true;
+}
+
+// 線圈溫升碰到上限：已有通過檔 → 用上一檔；第一檔就超過才鎖定。
+static bool stop_at_winding_rise(const char *reason)
+{
+    Serial.printf("[SAFE_I] winding rise %.1fC Rth=%.2f cold=%.2f (%s)\n",
+                  (double)meas_get_safe_winding_rise_C(),
+                  (double)meas_get_safe_rth_ohm(),
+                  (double)rth_cold_ohm,
+                  reason);
+    if (meas_get_safe_pass_any())
+    {
+        const float rpm = meas_get_safe_last_pass_rpm();
+        meas_set_thermal_limit_rpm(rpm);
+        begin_handoff_to_resistance(meas_get_safe_last_pass_A(), rpm, reason);
+        return false;
+    }
+    fail_hard(reason);
+    return true;
 }
 
 // 鱷魚夾／負載沒接上：暫停等 START，不鎖定、不丢掉已通過檔。
@@ -429,16 +580,16 @@ bool safe_current_step(uint32_t now_ms)
                 return done;
             }
         }
-        if (speed_get_speed_stable())
-        {
-            goto_phase(SAFE_PH_OC_SAMPLE);
-            return false;
-        }
         {
             const float target = meas_get_safe_target_rpm();
+            if (speed_get_speed_stable() && speed_within_target(target, speed_get_now_speed()))
+            {
+                goto_phase(SAFE_PH_OC_SAMPLE);
+                return false;
+            }
             if (drive_cannot_reach_target(elapsed, target))
             {
-                return finish_because_drive_limit("PWM at max, speed not reaching target");
+                return finish_because_drive_limit("speed not reaching target");
             }
             if (elapsed > speed_wait_timeout_ms(target))
             {
@@ -471,7 +622,11 @@ bool safe_current_step(uint32_t now_ms)
             // 補償發電機→防反接 SS54→INA232 這條路徑上的順向壓降，換回發電機端子的
             // 真實 Voc(見 settings.h 的 ss54_compensate_voltage_V() 說明)。開路時電流
             // 很小，補償量本來就不大，但一起做才能跟帶載那筆用同一套基準。
-            meas_set_safe_oc_voltage_V(ss54_compensate_voltage_V(ina_get_bus_V(), oc_a));
+            const float voc = ss54_compensate_voltage_V(ina_get_bus_V(), oc_a);
+            const float n_oc = speed_get_now_speed();
+            meas_set_safe_oc_voltage_V(voc);
+            rung_oc_rpm = n_oc;
+            rung_ke = (n_oc > 1.0f) ? (voc / n_oc) : 0.0f;
         }
         goto_phase(SAFE_PH_CONNECT);
         return false;
@@ -489,8 +644,7 @@ bool safe_current_step(uint32_t now_ms)
             const float i_now = fabsf(ina_get_current_A());
             if (i_now > (float)SAFE_I_HARD_CEILING_A)
             {
-                fail_hard("hard current ceiling exceeded while settling");
-                return true;
+                return stop_at_current_ceiling("hard current ceiling hit while settling, last pass");
             }
         }
         {
@@ -528,8 +682,9 @@ bool safe_current_step(uint32_t now_ms)
                 return false; // 單筆雜訊：再等，不把 0A 當成電氣穩態
             }
             meas_set_safe_electrical_A(i_elec);
-            judge_window_start_ms = now_ms;
-            judge_window_start_A = i_elec;
+            judge_window_start_ms = 0;
+            judge_window_start_rth = 0.0f;
+            soak_rth_settled = false;
             contact_open_since_ms = 0;
             contact_glitch_logged = false;
         }
@@ -555,8 +710,7 @@ bool safe_current_step(uint32_t now_ms)
         const uint32_t phase_elapsed = now_ms - meas_get_safe_phase_start_ms();
         if (i_now > (float)SAFE_I_HARD_CEILING_A)
         {
-            fail_hard("hard current ceiling exceeded during thermal soak");
-            return true;
+            return stop_at_current_ceiling("hard current ceiling hit during thermal soak, last pass");
         }
         if (confirm_contact_open(now_ms, i_now, v_now))
         {
@@ -575,12 +729,6 @@ bool safe_current_step(uint32_t now_ms)
             }
             return false;
         }
-        if (judge_window_start_ms == 0)
-        {
-            judge_window_start_ms = now_ms;
-            judge_window_start_A = i_now;
-            return false;
-        }
         {
             bool done = false;
             if (finish_if_brush_jump(now_ms, true, phase_elapsed, &done))
@@ -589,28 +737,90 @@ bool safe_current_step(uint32_t now_ms)
             }
         }
 
+        float rth = 0.0f;
+        float i_rth = i_now;
+        const bool have_rth = loaded_winding_rth(&rth, &i_rth);
+        const float target = meas_get_safe_target_rpm();
+        const bool speed_back = speed_within_target(target, speed_get_now_speed());
+
+        if (have_rth && speed_back && rth_cold_ohm <= 0.0f)
+        {
+            rth_cold_acc += rth;
+            rth_cold_n++;
+            if (rth_cold_n >= (uint8_t)SAFE_RTH_COLD_SAMPLES)
+            {
+                rth_cold_ohm = rth_cold_acc / (float)rth_cold_n;
+                Serial.printf("[SAFE_I] cold Rth=%.2f ohm (%u samples)\n",
+                              (double)rth_cold_ohm, (unsigned)rth_cold_n);
+            }
+        }
+        if (have_rth)
+        {
+            publish_winding(rth);
+            if (rth_cold_ohm > 0.05f &&
+                meas_get_safe_winding_rise_C() >= winding_rise_limit_c())
+            {
+                return stop_at_winding_rise("winding temperature rise at limit, last pass");
+            }
+        }
+
+        // 轉速還沒拉回：熱穩窗先不算。爬不動就收掉，不再空等下一檔。
+        if (!speed_back)
+        {
+            judge_window_start_ms = 0;
+            if (drive_cannot_reach_target(phase_elapsed, target))
+            {
+                return finish_because_drive_limit("loaded speed not recovering to target");
+            }
+            if (phase_elapsed >= (uint32_t)SAFE_THERMAL_SOAK_MAX_MS)
+            {
+                soak_rth_settled = false;
+                rung_result_rpm = speed_get_now_speed();
+                meas_set_safe_hot_A(i_now);
+                goto_phase(SAFE_PH_JUDGE);
+            }
+            return false;
+        }
+
+        if (!have_rth || rth_cold_ohm <= 0.0f)
+        {
+            if (phase_elapsed >= (uint32_t)SAFE_THERMAL_SOAK_MAX_MS)
+            {
+                return fail_ina_mismatch("thermal soak ended without a winding resistance sample");
+            }
+            return false;
+        }
+
+        if (judge_window_start_ms == 0 || judge_window_start_rth <= 0.0f)
+        {
+            judge_window_start_ms = now_ms;
+            judge_window_start_rth = rth;
+            return false;
+        }
+
         if ((now_ms - judge_window_start_ms) >= (uint32_t)SAFE_THERMAL_CHECK_WINDOW_MS)
         {
-            const float drop = judge_window_start_A - i_now;
-            const float ratio = (judge_window_start_A > 1e-6f) ? (drop / judge_window_start_A) : 0.0f;
-            if (fabsf(ratio) <= (float)SAFE_I_PASS_DROOP_RATIO)
+            const float ratio = (rth - judge_window_start_rth) / judge_window_start_rth;
+            if (fabsf(ratio) <= (float)SAFE_RTH_STABLE_RATIO)
             {
-                meas_set_safe_hot_A(i_now);
-                meas_set_safe_droop_ratio(ratio);
+                meas_set_safe_hot_A(i_rth);
+                soak_rth_settled = true;
+                rung_result_rpm = speed_get_now_speed();
+                Serial.printf("[SAFE_I] Rth settled %.2f ohm rise %.1fC @ %.0fRPM I=%.3f\n",
+                              (double)rth, (double)meas_get_safe_winding_rise_C(),
+                              (double)rung_result_rpm, (double)i_rth);
                 goto_phase(SAFE_PH_JUDGE);
                 return false;
             }
-            // 還沒打平：滑動觀察窗，繼續看，直到打平或撞到 SAFE_THERMAL_SOAK_MAX_MS 總逾時
             judge_window_start_ms = now_ms;
-            judge_window_start_A = i_now;
+            judge_window_start_rth = rth;
         }
 
         if (phase_elapsed >= (uint32_t)SAFE_THERMAL_SOAK_MAX_MS)
         {
-            const float drop = judge_window_start_A - i_now;
-            const float ratio = (judge_window_start_A > 1e-6f) ? (drop / judge_window_start_A) : 1.0f;
-            meas_set_safe_hot_A(i_now);
-            meas_set_safe_droop_ratio(ratio); // 逾時仍未打平：無論算出多少一律走 JUDGE 的「不通過」分支
+            meas_set_safe_hot_A(i_rth);
+            soak_rth_settled = false;
+            rung_result_rpm = speed_get_now_speed();
             goto_phase(SAFE_PH_JUDGE);
             return false;
         }
@@ -620,47 +830,43 @@ bool safe_current_step(uint32_t now_ms)
     case SAFE_PH_JUDGE:
     {
         load_switch_set(false); // 判定前先斷開，不再繼續加熱
-        // safe_droop_ratio 在 THERMAL_SOAK 只有兩種寫入時機：觀察窗內打平(ratio 已 ≤ 通過門檻)，
-        // 或總逾時仍未打平(ratio 當時就已經 > 通過門檻，才會落到逾時分支)——因此這裡單看
-        // ratio 是否 ≤ 通過門檻，兩種情況都能正確分流，不需要另外分辨「是否逾時」。
-        const float ratio = fabsf(meas_get_safe_droop_ratio());
-        const float rpm_now = meas_get_safe_target_rpm();
+        const float rpm_cmd = meas_get_safe_target_rpm();
+        const float rpm_pass = (rung_result_rpm > 1.0f) ? rung_result_rpm : rpm_cmd;
         const float hot_a = meas_get_safe_hot_A();
+        const float rise = meas_get_safe_winding_rise_C();
 
-        if (ratio <= (float)SAFE_I_PASS_DROOP_RATIO)
+        if (soak_rth_settled && rise < winding_rise_limit_c())
         {
-            // 本檔通過
             const float oc_v = meas_get_safe_oc_voltage_V();
             {
                 SettingsLockGuard lock(g_meas_mux);
                 meas_settings.safe_pass_any = true;
-                meas_settings.safe_last_pass_rpm = rpm_now;
+                meas_settings.safe_last_pass_rpm = rpm_pass;
                 meas_settings.safe_last_pass_A = hot_a;
                 meas_settings.safe_last_pass_oc_V = oc_v;
             }
-            const float next_rpm = rpm_now + (float)SAFE_RPM_STEP;
-            // 電流約正比轉速外推下一檔；預估會撞硬電流就收尾，不必真的接上去撞。
-            // 轉速終點不寫死：下一檔若主動力轉不到，WAIT_SPEED 會用上一檔進內阻。
-            const float predicted_next_a = (rpm_now > 1.0f) ? (hot_a * (next_rpm / rpm_now)) : hot_a;
+            const float next_rpm = rpm_cmd + (float)SAFE_RPM_STEP;
+            const float predicted_next_a = (rpm_pass > 1.0f) ? (hot_a * (next_rpm / rpm_pass)) : hot_a;
             if (predicted_next_a >= (float)SAFE_I_HARD_CEILING_A)
             {
-                begin_handoff_to_resistance(hot_a, rpm_now, "predicted next current at ceiling");
+                begin_handoff_to_resistance(hot_a, rpm_pass, "predicted next current at ceiling");
                 return false;
             }
+            clear_rung_sample();
             meas_set_safe_target_rpm(next_rpm);
             goto_phase(SAFE_PH_COOLDOWN);
             return false;
         }
 
-        // 本檔不通過(打平但下垂偏大，或逾時仍未打平)
         if (meas_get_safe_pass_any())
         {
-            begin_handoff_to_resistance(meas_get_safe_last_pass_A(),
-                                       meas_get_safe_last_pass_rpm(),
-                                       "thermal fail, last pass");
+            const float rpm = meas_get_safe_last_pass_rpm();
+            meas_set_thermal_limit_rpm(rpm);
+            begin_handoff_to_resistance(meas_get_safe_last_pass_A(), rpm,
+                                       "winding resistance still rising, last pass");
             return false;
         }
-        fail_hard("first rung failed thermal droop check — cannot establish any safe continuous current");
+        fail_hard("first rung winding resistance did not settle — cannot establish any safe continuous current");
         return true;
     }
 

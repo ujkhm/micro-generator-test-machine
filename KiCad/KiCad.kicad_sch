@@ -8211,7 +8211,7 @@
 				(justify left)
 			)
 		)
-		(property "Value" "0.1R"
+		(property "Value" "0.05R"
 			(at 109.22 106.6799 0)
 			(effects
 				(font

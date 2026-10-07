@@ -1,4 +1,5 @@
 #include "speed_sensor.h"
+#include "debug_tee/debug_tee.h"
 
 // 載入設定和共享變數
 volatile speed_sensor settings{};

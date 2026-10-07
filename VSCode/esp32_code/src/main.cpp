@@ -7,6 +7,7 @@
 #include "board_ui/board_ui.h"
 #include "measure_seq/measure_seq.h"
 #include "bt_telemetry/bt_telemetry.h"
+#include "debug_tee/debug_tee.h"
 
 // ★記憶體保護★：main.cpp 是純粹的「協調 + 顯示」層，對所有共享狀態的存取
 // 一律透過 settings.h 提供的介面(speed_get/set_x、pid_get/set_x、ina_get_x、

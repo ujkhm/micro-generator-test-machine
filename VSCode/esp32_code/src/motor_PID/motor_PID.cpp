@@ -1,5 +1,6 @@
 #include "motor_PID.h"
 #include <sTune.h>
+#include "debug_tee/debug_tee.h"
 
 // 算完脈衝數後用於呼叫PID任務的旗標實體
 TaskHandle_t xPIDTaskHandle = NULL;

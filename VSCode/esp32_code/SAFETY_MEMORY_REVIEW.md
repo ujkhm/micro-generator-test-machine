@@ -216,12 +216,12 @@ Flash: 90.1% (used 1181311 bytes from 1310720 bytes)
 
 以下常數已在 `settings.h` 內逐一加註「★依實際機台調整」，這裡集中列出，實際上機前務必檢視：
 
-- `SAFE_I_HARD_CEILING_A`(預設 0.6A，須低於 INA232 0.8A 滿量程)
+- `SAFE_I_HARD_CEILING_A`(預設 1.2A，須低於 INA232 1.6A 量程；已有通過檔時碰到上限改為斷負載、用上一檔進內阻，只有第一檔就超過才鎖定)
 - `SAFE_RPM_STEP`(預設 300RPM)、`SAFE_RPM_MAX_CEILING`(預設 6000RPM，務必遠低於 `RPM_RUNAWAY_MAX`=17000)
 - `SAFE_COOLDOWN_MS`(預設 30 秒，依實際散熱調整)
 - `GEN_LINK_LOST_V_MAX`(預設 0.15V，須遠小於最低轉速下的開路電壓)
 - `CURVE_V_ALLOW`(預設 40V，須低於 INA232 與後級真正的耐壓)
-- `LOAD_TEST_RESISTOR_OHM`(預設 20Ω，需與實際外接電阻一致；改了必須同步更新，程式本身不會自動偵測外接電阻的實際阻值)
+- `LOAD_TEST_RESISTOR_OHM`(預設 3Ω，三顆 1Ω 串聯，需與實際外接電阻一致；改了必須同步更新，程式本身不會自動偵測外接電阻的實際阻值)
 
 另外兩個**設計上的簡化**，不是缺陷，但要知道：
 

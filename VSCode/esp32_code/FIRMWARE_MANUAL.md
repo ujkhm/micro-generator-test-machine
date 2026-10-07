@@ -65,7 +65,7 @@ micro generator/
 | INA232 SDA/SCL | 21/22 | `SDA2_PIN`/`SCL2_PIN` | 軟體 I2C；板端可能無外接上拉 |
 | Servo / Buck | 23 / 14 | 已定義，目前韌體未驅動 | 預留給後續 MPPT／致動 |
 
-INA232 預設位址 `0x40`（A0→GND），分流電阻 `0.1Ω`。
+INA232 預設位址 `0x40`（A0→GND），分流電阻 `0.05Ω`（滿量程約 1.64A）。
 
 ---
 
@@ -538,8 +538,8 @@ Arduino-ESP32 3.x 硬體 I2C 在 NACK 後可能卡 `INVALID_STATE`。
 | `START_DEBOUNCE_MS` | 40 |
 | `UI_REFRESH_MS` | 200 |
 | `I2C_INA_FREQ_HZ` | 100000 |
-| `INA232_RSHUNT_OHM` | 0.1 |
-| `INA232_IMAX_A` | 0.8 |
+| `INA232_RSHUNT_OHM` | 0.05 |
+| `INA232_IMAX_A` | 1.6 |
 
 ---
 

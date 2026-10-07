@@ -1,6 +1,9 @@
 #include "gen_resistance.h"
 #include "measure_seq/measure_seq.h"
 #include "pins/pins.h"
+#include "debug_tee/debug_tee.h"
+
+static float res_oc_rpm = 0.0f; // 開路取樣當下的轉速，帶載時用來把 Voc 對到同一轉速
 
 // 高/中/低三個轉速點：低＝安全電流階梯實際的起始轉速(自動調參後系統自然停下來的那個
 // 轉速，不是任何寫死的常數)；高＝安全電流實際通過的最高檔(I_cont 對應的轉速)；
@@ -31,6 +34,7 @@ static void goto_phase(uint8_t ph)
 
 void gen_resistance_reset()
 {
+    res_oc_rpm = 0.0f;
     load_switch_set(false);
     SettingsLockGuard lock(g_meas_mux);
     meas_settings.res_phase = RES_PH_PREP;
@@ -54,6 +58,7 @@ void gen_resistance_reset()
 
 void gen_resistance_rewind_current_point()
 {
+    res_oc_rpm = 0.0f;
     load_switch_set(false);
     goto_phase(RES_PH_PREP);
     Serial.printf("[RES] rewind current point PREP idx=%u valid_points=%u\n",
@@ -171,6 +176,7 @@ bool gen_resistance_step(uint32_t now_ms)
             // 補償防反接 SS54 的順向壓降，換回發電機端子的真實 Voc；下面帶載那筆(RES_PH_LOAD_SAMPLE)
             // 也用同一套補償，R_th=(Voc-V)/I 兩邊才是同一個基準，不會因為補償不一致而算錯。
             const float voc = ss54_compensate_voltage_V(ina_get_bus_V(), oc_a);
+            res_oc_rpm = speed_get_now_speed();
             meas_set_res_oc_voltage_V(voc);
 
             // 接通前預檢：帶載電流 I ≈ Voc/(R_th+R_load)，不可用 Voc/R_load(當 R_th=0)——
@@ -286,9 +292,13 @@ bool gen_resistance_step(uint32_t now_ms)
         const float voc = meas_get_res_oc_voltage_V();
         const float v = meas_get_res_load_V();
         const float i = meas_get_res_load_A();
-        const float target = meas_get_res_target_rpm();
-        const float rth = (i > 1e-6f) ? ((voc - v) / i) : -1.0f;
-        const float ke = (target > 1.0f) ? (voc / target) : 0.0f;
+        const float n_load = speed_get_now_speed();
+        const float n_oc = res_oc_rpm;
+        // 開路與帶載的轉速若還有一點差，把 Voc 乘上 n_load/n_oc，避免轉速沒完全拉回就把差算進 R_th。
+        const float voc_at_load = (n_oc > 1.0f && n_load > 1.0f) ? (voc * (n_load / n_oc)) : voc;
+        const float rpm_point = (n_load > 1.0f) ? n_load : meas_get_res_target_rpm();
+        const float rth = (i > 1e-6f) ? ((voc_at_load - v) / i) : -1.0f;
+        const float ke = (n_oc > 1.0f) ? (voc / n_oc) : 0.0f;
 
         if (!(isfinite(rth) && isfinite(ke)) || rth < (float)RES_MIN_OHM ||
             rth > (float)RES_MAX_OHM || ke <= 0.0f)
@@ -300,12 +310,12 @@ bool gen_resistance_step(uint32_t now_ms)
         }
         else
         {
-            meas_res_set_point(idx, target, rth, ke);
+            meas_res_set_point(idx, rpm_point, rth, ke);
             SettingsLockGuard lock(g_meas_mux);
             meas_settings.res_valid_points = meas_settings.res_valid_points + 1;
-            Serial.printf("[RES] point %u ok: rpm=%.0f Voc=%.3f V=%.3f I=%.3f Rth=%.4f ke=%.6f\n",
-                          (unsigned)idx, (double)target, (double)voc, (double)v, (double)i,
-                          (double)rth, (double)ke);
+            Serial.printf("[RES] point %u ok: rpm=%.0f Voc=%.3f(aligned %.3f) V=%.3f I=%.3f Rth=%.4f ke=%.6f\n",
+                          (unsigned)idx, (double)rpm_point, (double)voc, (double)voc_at_load,
+                          (double)v, (double)i, (double)rth, (double)ke);
         }
 
         meas_set_res_point_index(idx + 1);

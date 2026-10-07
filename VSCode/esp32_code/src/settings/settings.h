@@ -155,12 +155,12 @@ enum speed_fault_code : uint8_t
 #define I2C_INA_FREQ_HZ 100000  // INA232(Wire1 / I2C1)：板端無外接上拉，必須用 100k；有外接 4.7k 後可改 400000
 
 // ---- INA232 電壓/電流感測 ----
-// 原理圖 R8=0.1Ω(2512)；ADCRANGE=0(±81.92mV) → 理論最大約 0.819A，故 Imax 取 0.8A 留餘量
+// 原理圖 R8=0.05Ω(2512)；ADCRANGE=0(±81.92mV) → 理論最大約 1.638A，故 Imax 取 1.6A 留餘量
 // 晶片 AVG=16。帶載時 V 仍像被測試電阻拉住而 I≈0：標 current_plausible=false，
 // 不把這筆寫進 EMA、也不准安全電流／內阻拿去算結果。不可用上一筆電流假裝還在測。
 #define INA232_I2C_ADDR 0x40     // INA232A + A0→GND；若 A0 接 VS/SDA/SCL 請改 0x41/0x42/0x43
-#define INA232_RSHUNT_OHM 0.1f   // 分流電阻(Ω)，對應原理圖 R8
-#define INA232_IMAX_A 0.8f       // 預期最大電流(A)，用於計算 Current_LSB / Calibration
+#define INA232_RSHUNT_OHM 0.05f  // 分流電阻(Ω)，對應原理圖 R8；實物必須同步換成 0.05Ω
+#define INA232_IMAX_A 1.6f       // 預期最大電流(A)，用於計算 Current_LSB / Calibration
 #define INA232_ADCRANGE_80MV 1   // 1=±81.92mV(ADCRANGE=0)；0=±20.48mV(ADCRANGE=1，CAL 需 /4)
 #define INA232_AVG_CODE 2        // CONFIG AVG 欄位：0=1、1=4、2=16、3=64（datasheet Table 7-4）
 #define INA232_FILTER_ALPHA 0.2f // ESP32 端 EMA 係數(愈小愈平滑、愈慢反應)
@@ -554,7 +554,7 @@ SETTINGS_SCALAR_ACCESSOR(ui, ui_settings, g_ui_mux, oled_ok, bool)
 
 // ---- 負載開關：沿用 pins.h 既有的 SERVO_PIN(不改名)，高電位＝把測試負載接上發電機 ----
 #define LOAD_SWITCH_ACTIVE_HIGH 1    // 1=高電位接通負載；0=低電位接通
-#define LOAD_TEST_RESISTOR_OHM (10.0f / 3.0f) // 三顆 10Ω 並聯≈3.33Ω；須與實物一致，程式不會自測外接電阻
+#define LOAD_TEST_RESISTOR_OHM 3.0f // 三顆 1Ω 串聯；須與實物一致，程式不會自測外接電阻
 #define LOAD_SWITCH_SETTLE_MS 60     // 切換負載後，繼電器/MOSFET 接點穩定的等待(ms)
 
 // ---- 發電機防反接串聯蕭特基二極體(SS54)電壓補償 ----
@@ -608,7 +608,7 @@ inline float ss54_compensate_voltage_V(float measured_bus_V, float current_A)
 #define GEN_LINK_LOST_TIMEOUT_MS 3000 // 連續無輸出超過此時間才判定斷線("超過數秒")，避免瞬間雜訊誤判
 
 // ---- 安全電流識別(SAFE_CURRENT_ARCH.md) ----
-#define SAFE_I_HARD_CEILING_A 0.6f                      // 硬電流天花板，必須低於 INA232 0.8A 滿量程(★依實際電機調整)
+#define SAFE_I_HARD_CEILING_A 1.2f                      // 硬電流天花板(約滿量程 73%，與舊 0.6/0.82 同比例)，必須低於 INA232 1.6A 量程(★依實際電機調整)
 #define SAFE_I_MIN_VALID_A 0.02f                        // 電流低於此值才「有資格」再看是不是開路
 #define SAFE_I_OPEN_V_RATIO 0.50f                       // V >= Voc*此比例才像真開路(帶載時端子會被拉低很多)
 #define SAFE_I_CONTACT_CONFIRM_MS 400                   // 開路特徵需連續成立才當夾子鬆脫；INA 單筆電流雜訊不算
@@ -628,8 +628,12 @@ inline bool ina_loaded_vi_mismatch(float bus_V, float current_A)
     }
     return fabsf(current_A) < i_from_v * (float)INA_I_VS_V_MIN_RATIO;
 }
-#define SAFE_I_PASS_DROOP_RATIO 0.03f                   // 熱穩後下垂 ≤ 此比例(3%) → 本檔通過
-#define SAFE_I_LIMIT_DROOP_RATIO 0.08f                  // 熱穩後下垂 ≥ 此比例(8%) → 本檔視為上限(不算通過)
+#define COPPER_TEMPCO_PER_C 0.00393f                    // 銅電阻溫度係數(1/°C)，約 20°C 附近
+#define SAFE_WINDING_RISE_MAX_C 40.0f                   // 未收到上位機設定時的預設溫升上限(°C)。上位機可下 RISE 指令覆蓋
+#define SAFE_RTH_STABLE_RATIO 0.02f                     // 觀察窗內 R_th 變化 ≤ 此比例才算熱穩(已用轉速、電壓、電流換算，不受轉速拉回影響)
+#define SAFE_RTH_COLD_SAMPLES 8                         // 第一檔轉速拉回後，幾筆 R_th 平均當作冷態基準
+#define SAFE_DRIVE_STALL_MIN_GAIN_RPM 40.0f             // 仍離目標、且這段時間轉速上升少於此值 → 主動力轉不到(不必等 PWM 頂滿)
+#define SAFE_SPEED_RECOVER_STEP_FRAC 0.40f              // 帶載後轉速須回到「檔距的此比例」以內才開始算熱穩，避免把上一檔的轉速當成這一檔
 #define SAFE_RPM_STEP 300.0f                            // 每檔轉速增量(★依實際機台調整)
 #define SAFE_RPM_MAX_CEILING 14000.0f                   // 僅曲線／n_lim 遠端守衛(須遠低於飛車 RPM_RUNAWAY_MAX)。安全電流階梯不再拿它當終點：PWM 頂滿仍轉不到下一檔 → 用上一檔進內阻
 #define SAFE_DRIVE_STALL_HOLD_MS 3000                   // WAIT_SPEED 期間 PWM 已頂滿且仍離目標太遠、持續此時長 → 判定主動力轉不到
@@ -735,6 +739,7 @@ enum curve_limit_reason : uint8_t
     LIMIT_REASON_CEILING = 4,      // 人為天花板最嚴，或資料不足只能用天花板
     LIMIT_REASON_BRUSH_JUMP = 5,   // 跳刷：尚未熱封頂就接觸不穩，n_lim 鎖在上一通過檔
     LIMIT_REASON_DRIVE_LIMIT = 6,  // 主動力轉不到下一檔：I_cont／n_lim 鎖在上一通過檔，不是硬故障
+    LIMIT_REASON_WINDING_TEMP = 7, // 線圈溫升達到 SAFE_WINDING_RISE_MAX_C：n_lim 鎖在上一通過檔
 };
 
 // 量測序列共享狀態：measure_seq 所在任務是唯一寫入者，其餘任務一律唯讀。
@@ -763,7 +768,10 @@ struct measure_settings
     float safe_oc_voltage_V = 0.0f;    // 本檔開路電壓(Voc)
     float safe_electrical_A = 0.0f;    // 本檔剛接通、電氣穩定後的電流
     float safe_hot_A = 0.0f;           // 本檔熱穩後的電流
-    float safe_droop_ratio = 0.0f;     // 本檔下垂比例((electrical-hot)/electrical)
+    float safe_droop_ratio = 0.0f;     // 線圈電阻相對冷態的上升比例 (R_th/R_0 - 1)，由轉速、電壓、電流換算
+    float safe_rth_ohm = 0.0f;         // 最近一筆帶載 R_th（已用當下轉速對齊）
+    float safe_winding_rise_C = 0.0f;  // 由 safe_rth_ohm 與冷態基準換算的銅溫升(°C)
+    float safe_winding_rise_limit_C = (float)SAFE_WINDING_RISE_MAX_C; // 使用者設定的停測溫升；超過則本檔不通過
     uint32_t safe_phase_start_ms = 0;  // 本子階段開始時間(供逾時判斷與畫面顯示經過時間)
     bool safe_done = false;            // 識別是否已完成且可信(i_cont 有效)
     bool safe_pass_any = false;        // 是否至少有一檔通過(第一檔就失敗要能分辨)
@@ -774,6 +782,7 @@ struct measure_settings
     float safe_last_pass_oc_V = 0.0f;  // 內部：上一通過檔的開路電壓(交接滑行用；光柵不可信時 Voc 才是真實轉速)
     float brush_jump_rpm = 0.0f;       // >0：本輪因跳刷提前結束，報表 n_lim 不得超過此轉速
     float drive_limit_rpm = 0.0f;      // >0：本輪因主動力轉不到下一檔結束，報表 n_lim 不得超過此轉速
+    float thermal_limit_rpm = 0.0f;    // >0：本輪因線圈溫升達到上限結束，報表 n_lim 不得超過此轉速
 
     // ==================== 內阻模組 ====================
     uint8_t res_phase = RES_PH_PREP; // 見 resistance_phase
@@ -827,6 +836,9 @@ SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, safe_oc_voltage_V, flo
 SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, safe_electrical_A, float)
 SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, safe_hot_A, float)
 SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, safe_droop_ratio, float)
+SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, safe_rth_ohm, float)
+SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, safe_winding_rise_C, float)
+SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, safe_winding_rise_limit_C, float)
 SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, safe_phase_start_ms, uint32_t)
 SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, safe_done, bool)
 SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, safe_pass_any, bool)
@@ -837,6 +849,7 @@ SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, safe_last_pass_A, floa
 SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, safe_last_pass_oc_V, float)
 SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, brush_jump_rpm, float)
 SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, drive_limit_rpm, float)
+SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, thermal_limit_rpm, float)
 
 SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, res_phase, uint8_t)
 SETTINGS_SCALAR_ACCESSOR(meas, meas_settings, g_meas_mux, res_point_index, uint8_t)

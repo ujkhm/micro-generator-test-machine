@@ -2,6 +2,7 @@
 #include "safe_current/safe_current.h"
 #include "gen_resistance/gen_resistance.h"
 #include "curve_calc/curve_calc.h"
+#include "debug_tee/debug_tee.h"
 
 // 共享狀態實體(其他模組只讀，本檔案所在任務是唯一寫入者)
 volatile measure_settings meas_settings{};
@@ -202,6 +203,7 @@ static void begin_new_session()
         meas_settings.curve_point_count = 0;
         meas_settings.brush_jump_rpm = 0.0f;
         meas_settings.drive_limit_rpm = 0.0f;
+        meas_settings.thermal_limit_rpm = 0.0f;
     }
     gen_resistance_reset();
     reset_link_monitor();
