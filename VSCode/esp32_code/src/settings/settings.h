@@ -121,6 +121,12 @@
 // 並在重新穩調前把輸出上限夾在該值加上這個餘量。
 #define PID_UNLOAD_HOLD_SLACK 40
 
+// 藍牙 OTA 比對用的韌體版本。發佈 GitHub Release 時，標籤要跟這串一致（標籤可多一個 v）。
+// 上位機看到線上版較新才會經藍牙寫入；機台自己不會上網。
+#ifndef FW_VERSION
+#define FW_VERSION "1.5.0"
+#endif
+
 // 轉速穩調旗標(speed_stable)判定：僅在整機正常閉環且貼近目標時才可能為 true
 #define SPEED_STABLE_ABS_EPS 40.0f             // |實際轉速-目標| 低於此值的基底(RPM)
 #define SPEED_STABLE_ABS_EPS_PER_1000RPM 28.0f // 隨目標轉速放寬：高轉時感測/PID 殘差較大

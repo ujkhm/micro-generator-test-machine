@@ -1,8 +1,13 @@
 #include "bt_telemetry.h"
 #include "BluetoothSerial.h"
 #include "debug_tee/debug_tee.h"
+#include "measure_seq/measure_seq.h"
+#include "pins/pins.h"
+#include <Update.h>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
+#include <mbedtls/sha256.h>
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled on this build (BluetoothSerial requires Bluedroid classic BT).
@@ -140,7 +145,7 @@ static void build_live_message()
     live_buf[0] = '\0';
 
     append(live_buf, sizeof(live_buf), len,
-           "{\"t\":\"live\",\"ts\":%lu,"
+           "{\"t\":\"live\",\"fw\":\"" FW_VERSION "\",\"ts\":%lu,"
            "\"ui_state\":%u,\"ui_state_name\":\"%s\","
            "\"fault\":%d,\"fault_code\":%u,\"fault_name\":\"%s\","
            "\"phase\":%u,\"phase_name\":\"%s\","
@@ -230,12 +235,195 @@ static inline void bt_increment_publish_count_wrapper()
     bt_settings.publish_count = bt_settings.publish_count + 1;
 }
 
-static char cmd_buf[48];
+static char cmd_buf[160];
 static size_t cmd_len = 0;
 
-// 上位機一行：RISE <溫升°C>。只接受 10～200，避免空字串或亂碼把上限清掉。
+static constexpr uint32_t OTA_MAX_IMAGE = 0x140000; // default.csv 的 app0／app1
+static constexpr size_t OTA_CHUNK = 512;
+static constexpr uint32_t OTA_CHUNK_IDLE_MS = 8000;
+
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9')
+    {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f')
+    {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F')
+    {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+static bool sha256_matches(const uint8_t digest[32], const char *hex)
+{
+    for (int i = 0; i < 32; i++)
+    {
+        const int hi = hex_nibble(hex[i * 2]);
+        const int lo = hex_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0 || digest[i] != (uint8_t)((hi << 4) | lo))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ota_read_exact(uint8_t *dst, size_t need, uint32_t idle_ms)
+{
+    size_t got = 0;
+    uint32_t last = millis();
+    while (got < need)
+    {
+        const int avail = SerialBT.available();
+        if (avail > 0)
+        {
+            const size_t want = (size_t)avail < (need - got) ? (size_t)avail : (need - got);
+            const size_t n = SerialBT.readBytes(dst + got, want);
+            if (n == 0)
+            {
+                vTaskDelay(pdMS_TO_TICKS(2));
+                continue;
+            }
+            got += n;
+            last = millis();
+        }
+        else if ((millis() - last) > idle_ms)
+        {
+            return false;
+        }
+        else
+        {
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+    }
+    return true;
+}
+
+static bool ota_measurement_busy()
+{
+    const uint8_t ph = meas_get_phase();
+    return ph == MEAS_MIN_SPEED_HOLD || ph == MEAS_SAFE_CURRENT ||
+           ph == MEAS_RESISTANCE || ph == MEAS_CURVE_CALC;
+}
+
+// 上位機已確認線上版較新。這裡只收檔、寫進沒在跑的那一區，成功才重開。
+// 呼叫期間不再推播 JSON，避免和韌體位元組混在同一條藍牙序列埠上。
+static void bt_run_ota(unsigned long image_size, const char *version, const char *sha_hex)
+{
+    if (ota_measurement_busy())
+    {
+        SerialBT.print("OTA FAIL busy\n");
+        return;
+    }
+    if (image_size == 0 || image_size > OTA_MAX_IMAGE || strlen(sha_hex) != 64)
+    {
+        SerialBT.print("OTA FAIL size\n");
+        return;
+    }
+
+    meas_set_pause_request(true);
+    speed_set_ol_pwm_cmd(0);
+    ledcWrite(MOTOR_PWM_PIN, 0);
+    load_switch_set(false);
+    Serial.printf("[OTA] begin %lu bytes version %s\n", image_size, version);
+
+    if (!Update.begin((size_t)image_size))
+    {
+        meas_set_pause_request(false);
+        SerialBT.print("OTA FAIL space\n");
+        Serial.printf("[OTA] Update.begin failed: %s\n", Update.errorString());
+        return;
+    }
+
+    SerialBT.print("OTA READY\n");
+    SerialBT.flush();
+    SerialBT.setTimeout(50);
+
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+
+    uint8_t chunk[OTA_CHUNK];
+    uint32_t got = 0;
+    bool io_ok = true;
+    while (got < image_size)
+    {
+        const size_t need = ((image_size - got) > OTA_CHUNK) ? OTA_CHUNK : (size_t)(image_size - got);
+        if (!ota_read_exact(chunk, need, OTA_CHUNK_IDLE_MS))
+        {
+            io_ok = false;
+            break;
+        }
+        if (Update.write(chunk, need) != need)
+        {
+            io_ok = false;
+            break;
+        }
+        mbedtls_sha256_update(&ctx, chunk, need);
+        got += (uint32_t)need;
+        SerialBT.printf("ACK %lu\n", (unsigned long)got);
+    }
+
+    uint8_t digest[32];
+    mbedtls_sha256_finish(&ctx, digest);
+    mbedtls_sha256_free(&ctx);
+
+    if (!io_ok || got != image_size)
+    {
+        Update.abort();
+        meas_set_pause_request(false);
+        SerialBT.print("OTA FAIL write\n");
+        Serial.printf("[OTA] failed after %lu/%lu bytes\n", (unsigned long)got, image_size);
+        return;
+    }
+    if (!sha256_matches(digest, sha_hex))
+    {
+        Update.abort();
+        meas_set_pause_request(false);
+        SerialBT.print("OTA FAIL hash\n");
+        Serial.printf("[OTA] sha256 mismatch\n");
+        return;
+    }
+    if (!Update.end(true))
+    {
+        Update.abort();
+        meas_set_pause_request(false);
+        SerialBT.print("OTA FAIL end\n");
+        Serial.printf("[OTA] Update.end failed: %s\n", Update.errorString());
+        return;
+    }
+
+    SerialBT.print("OTA OK\n");
+    SerialBT.flush();
+    Serial.printf("[OTA] written %s, restarting\n", version);
+    delay(200);
+    ESP.restart();
+}
+
+// 上位機一行：RISE <溫升°C>，或 OTA <位元組數> <版本> <sha256>。
 static void bt_handle_command(const char *line)
 {
+    if (strncmp(line, "OTA ", 4) == 0)
+    {
+        unsigned long image_size = 0;
+        char version[16];
+        char sha_hex[65];
+        version[0] = '\0';
+        sha_hex[0] = '\0';
+        if (sscanf(line, "OTA %lu %15s %64s", &image_size, version, sha_hex) != 3)
+        {
+            SerialBT.print("OTA FAIL cmd\n");
+            return;
+        }
+        bt_run_ota(image_size, version, sha_hex);
+        return;
+    }
+
     float rise = 0.0f;
     if (sscanf(line, "RISE %f", &rise) != 1)
     {
@@ -336,7 +524,7 @@ void bt_telemetry_start()
     xTaskCreatePinnedToCore(
         bt_telemetry_task,
         "bt_telemetry",
-        6144,
+        12288,
         NULL,
         RTOS_BT_TELEMETRY_LEVEL,
         NULL,

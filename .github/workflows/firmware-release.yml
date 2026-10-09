@@ -1,0 +1,26 @@
+name: firmware release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Build firmware
+        working-directory: VSCode/esp32_code
+        run: pio run
+      - name: Publish firmware.bin
+        uses: softprops/action-gh-release@v2
+        with:
+          files: VSCode/esp32_code/.pio/build/mhetesp32devkit/firmware.bin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
